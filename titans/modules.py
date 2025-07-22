@@ -2,8 +2,8 @@ import torch
 from torch import nn, cat
 import torch.nn.functional as F
 from utils import LayerNorm, l2norm
-
-
+import titans.utils as titans_utils
+import einops
 class ResidualNorm(nn.Module):
     def __init__(
             self,
@@ -190,3 +190,41 @@ class MemoryAttention(nn.Module):
         ff_out = h @ ffw2
 
         return attn_out + ff_out
+    
+class MultiHeadRMSNorm(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.rmsnorm = nn.RMSNorm(dim, elementwise_affine = False)
+        self.gamma = nn.Parameter(torch.zeros(heads, 1, dim))
+
+    def forward(self, x):
+        return self.rmsnorm(x) * self.gamma + 1.
+    
+class AveragePool(nn.Module):
+    def __init__(
+        self,
+        chunk_size,             
+    ):
+        super().__init__()
+        self.chunk_size = chunk_size
+    
+    def forward(
+            self,
+            x,
+            chunk_size = None
+    ):
+            chunk_size = titans_utils.default(chunk_size, self.chunk_size)
+            return einops.reduce(x, 'b (n c) d -> b n d', 'mean', c = chunk_size)
+    
+class AttentionPool(nn.Module):
+    def __init__(
+        self,
+        dim,
+        chunk_size
+    ):
+        chunk_size = titans_utils.default(chunk_size, self.chunk_size)
+        x = einops.rearrange(x, 'b (n c) d -> b n c d', c = chunk_size)
+        attn_logits = self.to_attn_logits(x)
+        attn = attn_logits.softmax(dim = -2)
+        return einops.reduce(x * attn, 'b n c d -> b n d', 'sum')
+    

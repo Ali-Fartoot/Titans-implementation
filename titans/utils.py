@@ -96,3 +96,50 @@ def Sequential(*modules):
 
 def l2norm(x):
     return F.normalize(x, dim=-1)
+
+
+def softclamp_max(t, max_value):
+    half_max_value = max_value / 2
+    return ((t / half_max_value).tanh() * half_max_value) + half_max_value
+
+def softclamp_grad_norm(t, max_value):
+    if is_empty_tensor(t):
+        return t
+
+    t, inverse = pack_one_with_inverse(t, 'bn *')
+
+    norm = t.norm(dim = -1, keepdim = True)
+    clamped_norm = softclamp_max(norm, max_value)
+
+    t = t * (clamped_norm / norm)
+    return inverse(t)
+
+def newtonschulz5(
+    t,
+    steps = 5,
+    eps = 1e-7,
+    coefs = (3.4445, -4.7750, 2.0315)
+):
+    if t.ndim <= 3:
+        return t
+
+    shape = t.shape
+    should_transpose = shape[-2] > shape[-1]
+
+    if should_transpose:
+        t = t.transpose(-1, -2)
+
+    t, inv_pack = pack_one_with_inverse(t, '* i j')
+    t = t / t.norm(dim = (-1, -2), keepdim = True).clamp(min = eps)
+
+    a, b, c = coefs
+
+    for _ in range(steps):
+        A = t @ t.transpose(-1, -2)
+        B = b * A + c * A @ A
+        t = a * t + B @ t
+
+    if should_transpose:
+        t = t.transpose(-1, -2)
+
+    return inv_pack(t)
