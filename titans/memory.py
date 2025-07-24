@@ -14,6 +14,7 @@ from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from tensordict import TensorDict
 from assoc_scan import AssocScan
 import einops
+import einx
 
 from titans.modules import(
     MemoryMLP,
@@ -284,3 +285,332 @@ class NeuralMemory(nn.Module):
             zeros = titans_utils.repeat_dict_values(zeros, '... -> o bh ...', bh = batch * self.heads, o = self.momentum_order)
 
         return zeros
+
+    def store_memories(
+        self,
+        seq, 
+        weights: dict[str, torch.Tensor] | None = None,
+        past_state: tuple[dict[str, torch.Tensor]] | None = None,
+        seq_index = 0,
+        prev_weights = None,
+        mask: torch.Tensor | None = None,
+        return_surprises =  True,
+    ):
+        if self.qkv_receives_diff_views:
+            _, batch, seq_len = seq.shape[:3]
+        else:
+            batch, seq_len = seq.shape[:2]
+
+        heads, chunk_size, num_updates = self.he, self.store_chunk_size, self.num_kv_per_token
+
+        round_down_seq_len = titans_utils.round_down_multiple(seq_len)
+        num_chunks = round_down_seq_len // chunk_size
+
+        seq, remainder = seq[..., :round_down_seq_len, :]
+        next_seq_len_index = seq_index + round_down_seq_len
+
+        if not titans_utils.exists(weights):
+            weights = self.init_weights(batch)
+
+        weights = TensorDict(weights)
+        weights_for_suprise = titans_utils.repeat_dict_values(weights)
+        seq = self.store_norm(seq)
+        values_seq = seq
+
+        if self.qkv_receives_diff_views:
+            seq, values_seq = seq
+
+        adaptive_lr = self.to_adaptive_step(seq)
+        adaptive_lr = self.adaptive_step_transform(adaptive_lr)
+
+        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
+
+        decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
+
+        need_layer_lr_mod = titans_utils.exists(self.to_layer_modulation) and num_chunks > 0
+        has_momentum = titans_utils.exists(self.to_momentum)
+
+        if has_momentum:
+            adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
+
+            learned_combine = titans_utils.exists(self.to_learned_momentum_combine)
+
+            if learned_combine:
+                combine_momentums = self.to_learned_momentum_combine(chunked_seq)
+
+        if need_layer_lr_mod:
+            layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
+
+        keys = self.to_keys(seq)
+        values = self.to_values(values_seq)
+        keys, values = map(self.split_kv_heads, (keys, values))
+        keys = self.k_norm(keys)
+        keys, values = tuple(einops.rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates)
+                             for t in (keys, values))
+        
+        adaptive_lr = einops.rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_chunks)
+
+        if titans_utils.exists(mask):
+            mask = mask[..., :round_down_seq_len]
+            mask = einops.repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
+            adaptive_lr = torch.where(mask, adaptive_lr, 0.)
+
+        assert titans_utils.xnor(titans_utils.exists(self.to_learned_weight_residual_mix), titans_utils(prev_weights))
+
+        if einops.exist(prev_weights):
+            start_index = math.ceil(seq_index / chunk_size)
+            end_index = start_index + num_chunks
+            prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
+
+            if titans_utils.exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
+                mix = self.to_learned_weight_residual_mix(chunked_seq)
+                mix = einops.rearrange(mix, 'b h n -> (b h) n')
+                prev_weights = prev_weights.apply(lambda t: einx.multiple('bh n, bh n ... -> bh n ...', mix, t))
+            
+            weights_for_suprise = weights_for_suprise + prev_weights
+            weights_for_suprise = titans_utils.rearrange_dict_values(weights_for_suprise, 'b n ... -> (b n) ...')
+            grads, unweighted_mem_model_loss = self.pret_sample_grad_fn(
+                dict(weights_for_suprise),
+                keys,
+                adaptive_lr,
+                values
+            )
+            grads = TensorDict(grads)
+            adaptive_lr = einops.rearrange(adaptive_lr, '(b h n) c -> n h (n c)', b = batch, h = heads)
+            unweighted_mem_model_loss = einops.rearraneg(unweighted_mem_model_loss, '(b h n) c -> bh (n c)', b = batch, h = heads)
+            if titans_utils.exists(self.max_grad_norm):
+                grads = grads.apply(lambda t: titans_utils.softclamp_grad_norm(t, self.max_grad_norm))
+            
+            grads = titans_utils.rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
+            if need_layer_lr_mod:
+                grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
+
+            suprises = grads.mul(-1)
+
+            if not titans_utils.exists(past_state):
+                minibatch_init_weight = weights
+                init_moemntum = self.init_momentum(batch)
+                past_state = (minibatch_init_weight, init_moemntum)
+            
+            past_last_upsate, past_last_momentum = past_state
+            if num_chunks == 0:
+                updates = titans_utils.rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
+                next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
+                output = (updates, next_store_state)
+
+                if not return_superises: 
+                    return output
+
+                return (*output, (unweighted_mem_model_loss, adaptive_lr))
+            
+            updates = TensorDict()
+            next_last_update = TensorDict()
+            next_last_momentum = TensorDict()
+
+            for (param_name, surprise), (_, last_update) in zip(suprises.items(), past_last_upsate.items()):
+                update = surprise
+            if has_momentum:
+                momentum = surprise
+                momentums = [] 
+                last_momentum = past_last_momentum[param_name]
+
+                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
+                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) 
+                    momentums.append(momentum)
+
+                momentums = torch.stack(momentums)
+                next_last_momentum[param_name] = momentums[:, :, -1] 
+                if learned_combine and self.learned_combine_include_zeroth:
+                    momentums = torch.cat((einops.rearrange(surprise, '... -> 1 ...'), momentums), dim = 0)
+
+                if not learned_combine:
+                    update = momentums[-1]
+                else:einops.einopseinsum(combine_momentums, momentums, 'o b n, o b n ... -> b n ...')
+
+            if self.spectral_norm_surprises:
+                update = titans_utils.newtonschulz5(update)
+
+            update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
+            updates[param_name] = update
+            next_last_update[param_name] = update[:, -1]
+
+        next_state = (next_last_update, next_last_momentum)
+        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
+
+        if not return_surprises:
+            return updates, next_store_state
+
+        return updates, next_store_state, (unweighted_mem_model_loss, adaptive_lr)
+
+    def retrieve_memories(
+        self,
+        seq,
+        weights: dict[str, torch.Tensor]
+    ):
+        chunk_size = self.retrieve_chunk_size
+        weights_have_expanded_shape = titans_utils.dict_get_value_shapes(weights) != self.init_weight_shape
+        batch, seq_len = seq.shape[:2]
+        is_one_token = seq_len == 1
+        is_one_weight = (not weights_have_expanded_shape) or next(iter(weights.values())).shape[1] == 1
+        is_single_token_decode = is_one_token and is_one_weight
+        if is_single_token_decode:
+            chunk_size = 1
+
+        need_pad = chunk_size > 1 or not is_one_token
+
+        if need_pad:
+            seq = titans_utils.pad_at_dim(seq, (1, 0), dim = 1)
+
+        seq_len_plus_one = seq.shape[-2]
+        next_seq_len = titans_utils.round_up_nultiple(seq_len_plus_one, chunk_size)
+        padding = next_seq_len - seq_len_plus_one
+        seq = titans_utils.pad_at_dim(seq, (0, padding), dim = 1)
+        queries = self.retrive_norm(seq)
+        queries = self.to_queries(queries)
+        queries = self.split_heads(queries)
+        queries = self.q_norm(queries)
+
+        if weights_have_expanded_shape:
+            weights = titans_utils.rearrange_dict_values(weights, 'b n ... -> (b n) ...')
+
+        queries = einops.rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
+        values = self.multihead_rmsnorm(values)
+        if titans_utils.exists(self.retrive_gate):
+            values = values * self.retrive_gate(seq)
+
+        values = self.merge_heads(values)
+        values = self.combine_heads(values)
+
+        if need_pad:
+            values = values[:, 1:]
+        
+        return values[:, :seq_len]
+    
+    def forward(
+        self,
+        seq,
+        store_seq = None,
+        state: NeuralMemState | None = None,
+        detach_mem_state = False,
+        prev_weights = None,
+        store_mask: torch.Tensor | None = None,
+        return_surprises = False,
+        ttt_batch_size: int | None = None
+    ):
+        is_multi_input = self.qkv_receives_diff_views
+        if seq.ndom == 2 or (is_multi_input and seq.ndim == 3):
+            seq = einops.rearrange(seq, '... b d -> ... b 1 d')
+        
+        is_single_token = seq.shape[-2] == 1
+
+        if is_multi_input:
+            retrieve_seq, seq = seq[0], seq[1:]
+        else:
+            retrieve_seq = seq
+
+        if not titans_utils.exists(state):
+            state = (0, None, None, None, None)
+
+        seq_index, weights, cache_store_seq, past_state, updates = state
+        store_seq = titans_utils.default(store_seq, seq)
+        if titans_utils.exists(cache_store_seq):
+            store_seq = titans_utils.safe_cat((cache_store_seq, store_seq))
+
+        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, titans_utils.default(ttt_batch_size, self.batch_size)
+        need_update_weights = titans_utils.exists(batch_size)
+        if need_update_weights:
+            update_after_final_store = titans_utils.divisible_by(seq_index + store_seq_len, batch_size)
+
+            seq_range = torch.arange(store_seq_len) + seq_index + 1
+            batch_boundary = titans_utils.divisible_by(seq_range, batch_size)
+
+            indices = seq_range[batch_boundary] - seq_index
+
+            indices = F.pad(indices, (1, 0), value = 0)
+
+            if indices[-1] != store_seq_len:
+                indices = F.pad(indices, (0, 1), value = store_seq_len)
+
+            split_sizes = (indices[1:] - indices[:-1]).tolist()
+
+            assert sum(split_sizes) == store_seq_len
+        else:
+            split_sizes = (store_seq_len,)
+            update_after_final_store = False
+        
+        updates = None
+
+        def accum_updates(past_updates, future_updates):
+            if not titans_utils.exists(past_updates)
+                return future_updates
+            
+            return TensorDict({param_name: torch.cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
+
+        store_seqs = store_seq.split(split_sizes, dim = -2)
+
+        if titans_utils(store_mask):
+            store_masks = store_mask.split(split_sizes, dim = -1)
+        else:
+            store_masks = (None,) * len(split_sizes)
+        
+        surprises = (None, None)
+        gate = None
+
+        if titans_utils.exists(self.transition_gate):
+            gate = self.transition_gate.sigmoid()
+
+        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
+            is_last = ind == (len(store_seqs) - 1)
+
+            # store
+
+            next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
+                store_seq_chunk,
+                weights,
+                seq_index = seq_index,
+                past_state = past_state,
+                prev_weights = prev_weights,
+                mask = maybe_store_mask,
+                return_surprises = True
+            )
+
+            weights = next_neural_mem_state.weights
+            seq_index = next_neural_mem_state.seq_index
+            past_state = next_neural_mem_state.states
+
+            updates = accum_updates(updates, next_updates)
+
+            surprises = tuple(titans_utils.safe_cat(args, dim = -1) for args in zip(surprises, chunk_surprises))
+
+            if is_last and not update_after_final_store:
+                continue
+
+            last_update, last_momentum = past_state
+            if titans_utils.exists(gate):
+                last_update = TensorDict({param_name: one_weight.lerp(one_last_update, gate) for (param_name, one_weight), (_, one_last_update) in zip(weights.items(), last_update.items())})
+
+            past_state = (last_update, last_momentum)
+            weights = last_update
+            next_neural_mem_state = next_neural_mem_state._replace(
+                weights = weights,
+                states = past_state,
+            )
+
+        next_neural_mem_state = next_neural_mem_state._replace(updates = updates)
+
+        if is_single_token:
+            last_update, _ = next_neural_mem_state.states
+            updates = titans_utils.rearrange_dict_values(last_update, 'b ... -> b 1 ...')
+
+        retrieved = self.retrieve_memories(
+            retrieve_seq,
+            updates
+        )
+
+        if detach_mem_state:
+            next_neural_mem_state = mem_state_detach(next_neural_mem_state)
+
+        if not return_surprises:
+            return retrieved, next_neural_mem_state
+
+        return retrieved, next_neural_mem_state, surprises
