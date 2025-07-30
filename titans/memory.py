@@ -398,7 +398,7 @@ class NeuralMemory(nn.Module):
                 next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
                 output = (updates, next_store_state)
 
-                if not return_superises: 
+                if not return_surprises: 
                     return output
 
                 return (*output, (unweighted_mem_model_loss, adaptive_lr))
@@ -541,7 +541,7 @@ class NeuralMemory(nn.Module):
         updates = None
 
         def accum_updates(past_updates, future_updates):
-            if not titans_utils.exists(past_updates)
+            if not titans_utils.exists(past_updates):
                 return future_updates
             
             return TensorDict({param_name: torch.cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
